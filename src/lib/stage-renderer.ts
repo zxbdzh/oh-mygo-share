@@ -1,4 +1,5 @@
 import type { ShareHotComment, ShareLyric, ShareLyricWord } from './types';
+import { createStageSurface } from './stage-surface';
 import {
 	clamp, easeOut, lerp, motionFactor, prepareStageLyrics, random, spring, stageSnapshot,
 	stageUnits, wordPose, type StageIntensity, type StageLanguage, type StageLine, type StageStyle
@@ -25,10 +26,10 @@ type PositionedWord = { word: ShareLyricWord; index: number; width: number };
 const family = "'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif";
 const japaneseFamily = "'Yu Gothic UI', 'Hiragino Sans', 'Meiryo', sans-serif";
 
-export function createStageRenderer(canvas: HTMLCanvasElement, getOptions: () => StageRendererOptions) {
-	const context = canvas.getContext('2d');
-	if (!context) return { render() {}, destroy() {} };
-	const painter = context;
+export function createStageRenderer(canvas: HTMLCanvasElement, getOptions: () => StageRendererOptions, fallbackCanvas: HTMLCanvasElement) {
+	const surface = createStageSurface(canvas, fallbackCanvas, render);
+	if (!surface) return { render() {}, destroy() {} };
+	let painter = surface.painter!;
 	const reduce = matchMedia('(prefers-reduced-motion: reduce)');
 	let animation = 0;
 	let boundaryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -366,7 +367,13 @@ export function createStageRenderer(canvas: HTMLCanvasElement, getOptions: () =>
 	}
 
 	function draw() {
+		surface?.paint(paint);
+	}
+
+	function paint() {
 		if (destroyed) return;
+		canvas = surface!.canvas;
+		painter = surface!.painter!;
 		options = getOptions();
 		position = Math.max(0, options.audio?.currentTime !== undefined ? options.audio.currentTime * 1000 : options.currentTimeMs);
 		motion = motionFactor(options.intensity, reduce.matches);
@@ -469,7 +476,7 @@ export function createStageRenderer(canvas: HTMLCanvasElement, getOptions: () =>
 	}
 
 	const observer = new ResizeObserver(render);
-	observer.observe(canvas);
+	observer.observe(canvas.parentElement ?? canvas);
 	document.addEventListener('visibilitychange', render);
 	reduce.addEventListener('change', render);
 	return {
@@ -482,6 +489,7 @@ export function createStageRenderer(canvas: HTMLCanvasElement, getOptions: () =>
 			reduce.removeEventListener('change', render);
 			if (cover) cover.onload = null;
 			textWidths.clear();
+			surface.destroy();
 		}
 	};
 }
