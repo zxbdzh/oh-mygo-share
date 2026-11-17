@@ -31,7 +31,7 @@ export type StagePainter = {
 };
 
 type Rect = { x: number; y: number; width: number; height: number; radius: number };
-type Texture = { handle: WebGLTexture; width: number; height: number; contentWidth: number; contentHeight: number; padding: number };
+type Texture = { handle: WebGLTexture; width: number; height: number; contentWidth: number; contentHeight: number; padding: number; density: number };
 type PaintState = {
 	font: string; textAlign: CanvasTextAlign; textBaseline: CanvasTextBaseline;
 	globalAlpha: number; fillStyle: string | Gradient; strokeStyle: string; lineWidth: number;
@@ -59,6 +59,8 @@ void main() {
 const fragmentShader = `#version 300 es
 precision highp float;
 uniform sampler2D uTexture;
+uniform sampler2D uNextTexture;
+uniform float uMaskMix;
 uniform vec4 uColor;
 uniform vec4 uClip;
 uniform float uClipRadius;
@@ -74,19 +76,17 @@ void main() {
 	if (uKind == 1 || uKind == 2) {
 		vec4 pixel = texture(uTexture, vUV);
 		if (uKind == 1) {
-			float alpha = pixel.a;
-			if (uBlur.x > 0.0) {
-				alpha = 0.0;
-				for (int row = -2; row <= 2; row++) {
-					for (int column = -2; column <= 2; column++) {
-						vec2 offset = vec2(float(column), float(row));
-						float weight = exp(-dot(offset, offset) / 2.0);
-						alpha += texture(uTexture, vUV + offset * uBlur).a * weight / 6.168924;
-					}
-				}
-			}
-			color.a *= alpha;
+			color.a *= mix(pixel.a, texture(uNextTexture, vUV).a, uMaskMix);
 		} else color *= pixel;
+	} else if (uKind == 4) {
+		float alpha = 0.0;
+		float totalWeight = 0.0;
+		for (int index = -6; index <= 6; index++) {
+			float weight = exp(-float(index * index) / 8.0);
+			alpha += texture(uTexture, vUV + float(index) * uBlur).a * weight;
+			totalWeight += weight;
+		}
+		color = vec4(1.0, 1.0, 1.0, alpha / totalWeight);
 	} else if (uKind == 3) {
 		float progress = clamp(distance(vPosition, uGradient.xy) / uGradient.z, 0.0, 1.0);
 		color = mix(uColor, uGradientEnd, progress);
@@ -120,6 +120,7 @@ class WebGLPainter implements StagePainter {
 	private path: Array<[number, number, boolean]> = [];
 	private rectangle: Rect | null = null;
 	private textures = new Map<string | HTMLImageElement, Texture>();
+	private pinned = new Set<WebGLTexture>();
 	private textureBytes = 0;
 	private colors = new Map<string, number[]>();
 	private measure = document.createElement('canvas').getContext('2d')!;
@@ -167,10 +168,11 @@ class WebGLPainter implements StagePainter {
 				gl.enableVertexAttribArray(attribute);
 				gl.vertexAttribPointer(attribute, 2, gl.FLOAT, false, 16, offset);
 			}
-			for (const name of ['Resolution', 'Texture', 'Color', 'Clip', 'ClipRadius', 'Gradient', 'GradientEnd', 'Blur', 'Kind']) {
+			for (const name of ['Resolution', 'Texture', 'NextTexture', 'MaskMix', 'Color', 'Clip', 'ClipRadius', 'Gradient', 'GradientEnd', 'Blur', 'Kind']) {
 				this.uniforms[name] = gl.getUniformLocation(program, `u${name}`);
 			}
 			gl.uniform1i(this.uniforms.Texture, 0);
+			gl.uniform1i(this.uniforms.NextTexture, 1);
 			gl.bindTexture(gl.TEXTURE_2D, white);
 			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
 			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -245,17 +247,22 @@ class WebGLPainter implements StagePainter {
 		return [color[0], color[1], color[2], color[3] * this.globalAlpha];
 	}
 
-	private upload(key: string | HTMLImageElement, image: HTMLCanvasElement, width: number, height: number, padding = 0): Texture {
-		const gl = this.gl;
-		const bytes = image.width * image.height * 4;
+	private reserve(bytes: number) {
 		// 歌词再长也只保留最近的纹理，手机端不随播放时长无限占用显存。
 		while (this.textures.size && (this.textureBytes + bytes > 16 * 1024 * 1024 || this.textures.size >= 256)) {
-			const oldest = this.textures.keys().next().value!;
+			const oldest = [...this.textures.keys()].find(key => !this.pinned.has(this.textures.get(key)!.handle));
+			if (oldest === undefined) throw new Error('GPU texture budget exceeded');
 			const entry = this.textures.get(oldest)!;
-			gl.deleteTexture(entry.handle);
+			this.gl.deleteTexture(entry.handle);
 			this.textureBytes -= entry.width * entry.height * 4;
 			this.textures.delete(oldest);
 		}
+	}
+
+	private upload(key: string | HTMLImageElement, image: HTMLCanvasElement, width: number, height: number, padding = 0, density = 1): Texture {
+		const gl = this.gl;
+		const bytes = image.width * image.height * 4;
+		this.reserve(bytes);
 		const handle = gl.createTexture();
 		if (!handle) throw new Error('GPU texture unavailable');
 		gl.bindTexture(gl.TEXTURE_2D, handle);
@@ -265,7 +272,7 @@ class WebGLPainter implements StagePainter {
 		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-		const entry = { handle, width: image.width, height: image.height, contentWidth: width, contentHeight: height, padding };
+		const entry = { handle, width: image.width, height: image.height, contentWidth: width, contentHeight: height, padding, density };
 		this.textures.set(key, entry);
 		this.textureBytes += bytes;
 		return entry;
@@ -279,15 +286,19 @@ class WebGLPainter implements StagePainter {
 
 	fillText(text: string, x: number, y: number) {
 		if (!text || this.globalAlpha === 0) return;
-		const key = `${this.font}\u0000${text}`;
+		const transform = this.state.transform;
+		// 文字纹理按实际像素放大倍率分档缓存，不能把低分辨率字形放大后再插值。
+		const density = Math.min(6, Math.max(2, Math.ceil(Math.max(Math.hypot(transform.a, transform.b), Math.hypot(transform.c, transform.d)))));
+		const key = `${this.font}\u0000${text}\u0000${density}`;
 		let texture = this.cached(key);
 		if (!texture) {
 			const size = Number(this.font.match(/([\d.]+)px/)?.[1] ?? 16);
-			const padding = 24;
+			const padding = Math.ceil(Math.max(32, size * .8));
 			const width = Math.max(1, this.measureText(text).width);
 			const height = Math.ceil(size * 1.8);
 			const image = document.createElement('canvas');
-			const ratio = Math.min(this.rasterScale, this.maxTextureSize / (width + padding * 2), this.maxTextureSize / (height + padding * 2));
+			const ratio = Math.min(density, this.maxTextureSize / (width + padding * 2), this.maxTextureSize / (height + padding * 2),
+				Math.sqrt(8 * 1024 * 1024 / 4 / (width + padding * 2) / (height + padding * 2)));
 			image.width = Math.max(1, Math.ceil((width + padding * 2) * ratio));
 			image.height = Math.max(1, Math.ceil((height + padding * 2) * ratio));
 			const context = image.getContext('2d')!;
@@ -296,21 +307,95 @@ class WebGLPainter implements StagePainter {
 			context.textBaseline = 'middle';
 			context.fillStyle = '#fff';
 			context.fillText(text, padding, padding + height / 2);
-			texture = this.upload(key, image, width, height, padding);
+			texture = this.upload(key, image, width, height, padding, ratio);
 		}
 		const left = x - (this.textAlign === 'center' ? texture.contentWidth / 2 : this.textAlign === 'right' || this.textAlign === 'end' ? texture.contentWidth : 0) - texture.padding;
 		const top = y - texture.contentHeight / 2 - texture.padding;
 		const width = texture.contentWidth + texture.padding * 2;
 		const height = texture.contentHeight + texture.padding * 2;
 		const blur = Number(this.filter.match(/blur\(([\d.]+)px\)/)?.[1] ?? 0);
-		if (this.shadowBlur > 0) this.quad(left, top, width, height, this.color(this.shadowColor), 1, texture, Math.max(blur, this.shadowBlur / 2));
-		this.quad(left, top, width, height, this.color(typeof this.fillStyle === 'string' ? this.fillStyle : '#fff'), 1, texture, blur);
+		const displayScale = Math.max(.01, Math.max(Math.hypot(transform.a, transform.b), Math.hypot(transform.c, transform.d)) / this.rasterScale);
+		this.pinned.add(texture.handle);
+		try {
+			if (this.shadowBlur > 0) this.drawMask(key, texture, left, top, width, height, this.color(this.shadowColor), Math.max(blur, this.shadowBlur / 2 / displayScale));
+			this.drawMask(key, texture, left, top, width, height, this.color(typeof this.fillStyle === 'string' ? this.fillStyle : '#fff'), blur);
+		} finally { this.pinned.clear(); }
+	}
+
+	private drawMask(key: string, texture: Texture, x: number, y: number, width: number, height: number, color: number[], blur: number) {
+		if (blur <= .01) { this.quad(x, y, width, height, color, 1, texture); return; }
+		const lower = blur < 1 ? 0 : 2 ** Math.floor(Math.log2(blur));
+		const upper = lower === 0 ? 1 : lower * 2;
+		const first = lower === 0 ? texture : this.blurred(key, texture, lower);
+		this.pinned.add(first.handle);
+		const second = this.blurred(key, texture, upper);
+		this.pinned.add(second.handle);
+		this.quad(x, y, width, height, color, 1, first, undefined, [0, 0, 1, 1], second, (blur - lower) / (upper - lower));
+	}
+
+	private blurred(key: string, source: Texture, radius: number): Texture {
+		const cacheKey = `${key}\u0000blur:${radius}`;
+		const cached = this.cached(cacheKey);
+		if (cached) return cached;
+		const gl = this.gl;
+		const logicalWidth = source.contentWidth + source.padding * 2;
+		const logicalHeight = source.contentHeight + source.padding * 2;
+		const density = Math.min(source.density, 2 / radius);
+		const width = Math.max(1, Math.ceil(logicalWidth * density)), height = Math.max(1, Math.ceil(logicalHeight * density));
+		this.reserve(width * height * 8);
+		const framebuffer = gl.createFramebuffer();
+		const temporary = gl.createTexture(), output = gl.createTexture();
+		if (!framebuffer || !temporary || !output) {
+			gl.deleteFramebuffer(framebuffer); gl.deleteTexture(temporary); gl.deleteTexture(output);
+			throw new Error('GPU blur resources unavailable');
+		}
+		try {
+			// 在合适分辨率上逐像素做横、纵两次高斯滤波，避免稀疏采样把笔画复制成条纹。
+			gl.disable(gl.BLEND);
+			gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+			for (const [index, target] of [temporary, output].entries()) {
+				gl.activeTexture(gl.TEXTURE0);
+				gl.bindTexture(gl.TEXTURE_2D, target);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+				gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+				if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU blur framebuffer unavailable');
+				gl.viewport(0, 0, width, height);
+				gl.uniform2f(this.uniforms.Resolution, width, height);
+				gl.uniform1i(this.uniforms.Kind, 4);
+				gl.uniform4f(this.uniforms.Color, 1, 1, 1, 1);
+				gl.uniform4f(this.uniforms.Clip, 0, 0, 0, 0);
+				gl.uniform2f(this.uniforms.Blur, index === 0 ? 1 / width : 0, index === 1 ? 1 / height : 0);
+				gl.activeTexture(gl.TEXTURE1);
+				gl.bindTexture(gl.TEXTURE_2D, this.white);
+				gl.activeTexture(gl.TEXTURE0);
+				gl.bindTexture(gl.TEXTURE_2D, index === 0 ? source.handle : temporary);
+				this.vertices.set([0, 0, 0, 0, width, 0, 1, 0, 0, height, 0, 1, 0, height, 0, 1, width, 0, 1, 0, width, height, 1, 1]);
+				gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.vertices);
+				gl.drawArrays(gl.TRIANGLES, 0, 6);
+			}
+			const texture = { ...source, handle: output, width, height, density };
+			this.textures.set(cacheKey, texture);
+			this.textureBytes += width * height * 4;
+			return texture;
+		} catch (error) { gl.deleteTexture(output); throw error; }
+		finally {
+			gl.deleteTexture(temporary);
+			gl.deleteFramebuffer(framebuffer);
+			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+			gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+			gl.uniform2f(this.uniforms.Resolution, this.canvas.width, this.canvas.height);
+			gl.enable(gl.BLEND);
+		}
 	}
 
 	fillRect(x: number, y: number, width: number, height: number) {
 		if (this.fillStyle instanceof RadialGradient) {
 			const gradient = this.fillStyle;
-			this.quad(x, y, width, height, this.color(gradient.stops[0]?.color ?? 'transparent'), 3, undefined, 0, gradient);
+			this.quad(x, y, width, height, this.color(gradient.stops[0]?.color ?? 'transparent'), 3, undefined, gradient);
 		} else this.quad(x, y, width, height, this.color(typeof this.fillStyle === 'string' ? this.fillStyle : '#fff'), 0);
 	}
 	beginPath() { this.path = []; this.rectangle = null; }
@@ -341,11 +426,11 @@ class WebGLPainter implements StagePainter {
 			raster.getContext('2d')!.drawImage(image, 0, 0, raster.width, raster.height);
 			texture = this.upload(image, raster, image.naturalWidth, image.naturalHeight);
 		}
-		this.quad(dx, dy, dw, dh, [1, 1, 1, this.globalAlpha], 2, texture, 0, undefined,
+		this.quad(dx, dy, dw, dh, [1, 1, 1, this.globalAlpha], 2, texture, undefined,
 			[sx / image.naturalWidth, sy / image.naturalHeight, (sx + sw) / image.naturalWidth, (sy + sh) / image.naturalHeight]);
 	}
 
-	private quad(x: number, y: number, width: number, height: number, color: number[], kind: number, texture?: Texture, blur = 0, gradient?: RadialGradient, uv = [0, 0, 1, 1]) {
+	private quad(x: number, y: number, width: number, height: number, color: number[], kind: number, texture?: Texture, gradient?: RadialGradient, uv = [0, 0, 1, 1], nextTexture?: Texture, maskMix = 0) {
 		if (this.disposed || width <= 0 || height <= 0) return;
 		const gl = this.gl;
 		const transform = this.state.transform;
@@ -358,7 +443,10 @@ class WebGLPainter implements StagePainter {
 		gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.vertices);
 		gl.uniform4fv(this.uniforms.Color, color);
 		gl.uniform1i(this.uniforms.Kind, kind);
-		gl.uniform2f(this.uniforms.Blur, texture ? blur * this.rasterScale / texture.width / 2 : 0, texture ? blur * this.rasterScale / texture.height / 2 : 0);
+		gl.uniform1f(this.uniforms.MaskMix, maskMix);
+		gl.activeTexture(gl.TEXTURE1);
+		gl.bindTexture(gl.TEXTURE_2D, nextTexture?.handle ?? texture?.handle ?? this.white);
+		gl.activeTexture(gl.TEXTURE0);
 		gl.bindTexture(gl.TEXTURE_2D, texture?.handle ?? this.white);
 		const clip = this.state.clip;
 		gl.uniform4f(this.uniforms.Clip, clip ? transform.a * clip.x + transform.e : 0, clip ? transform.d * clip.y + transform.f : 0, clip ? clip.width * transform.a : 0, clip ? clip.height * transform.d : 0);
