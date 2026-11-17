@@ -1,5 +1,12 @@
 FROM node:24-bookworm-slim AS build
 
+# ARM64 的 SQLite 依赖需要本机编译，工具链只留在构建阶段。
+RUN apt-get update \
+	&& apt-get install --no-install-recommends -y python3 make g++ ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+ENV npm_config_nodedir=/usr/local
+
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
