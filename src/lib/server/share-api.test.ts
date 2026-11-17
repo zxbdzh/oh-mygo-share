@@ -36,6 +36,96 @@ describe('share management HTTP API', () => {
 		await rm(directory, { recursive: true, force: true });
 	});
 
+	it('reuses an identical published snapshot without renewing or opening it', async () => {
+		await api.close();
+		let clock = new Date('2026-11-17T00:00:00Z');
+		const options = {
+			databasePath: join(directory, 'shares.sqlite'), mediaDirectory: join(directory, 'media'),
+			adminToken: 'local-test-token', now: () => new Date(clock),
+			mediaProcessor: async (source: string, output: string) => {
+				await copyFile(source, output);
+				return { mimeType: 'audio/mpeg', durationMs: 180_000 };
+			}
+		};
+		api = createShareApi(options);
+		const headers = { authorization: 'Bearer local-test-token', 'content-type': 'application/json' };
+		const lookup = (authorized = true) => api.fetch(new Request('http://share.test/api/shares/reuse', {
+			method: 'POST', headers: authorized ? headers : { 'content-type': 'application/json' },
+			body: JSON.stringify(metadata)
+		}));
+		expect((await lookup(false)).status).toBe(401);
+		expect((await lookup()).status).toBe(204);
+		const created = await api.fetch(new Request('http://share.test/api/shares', {
+			method: 'POST', headers: { ...headers, 'idempotency-key': 'reusable-snapshot' },
+			body: JSON.stringify(metadata)
+		}));
+		const share = await created.json();
+		await api.fetch(new Request(`http://share.test/api/shares/${share.id}/audio`, {
+			method: 'PUT', headers: { ...headers, 'content-type': 'audio/mpeg' }, body: new Uint8Array([1, 2, 3, 4])
+		}));
+		await expect.poll(async () => (await lookup()).status).toBe(200);
+		const original = await (await lookup()).json();
+		await api.close();
+		clock = new Date('2026-11-17T01:00:00Z');
+		api = createShareApi(options);
+		const reused = await (await lookup()).json();
+		expect(reused.id).toBe(share.id);
+		expect(reused.url).toBe(original.url);
+		expect(reused.expiresAt).toBe(original.expiresAt);
+		expect(reused.lastOpenedAt).toBeUndefined();
+		const listing = await (await api.fetch(new Request('http://share.test/api/shares', { headers }))).json();
+		expect(listing.shares).toHaveLength(1);
+	});
+
+	it('never reuses changed, unfinished, revoked or expired shares', async () => {
+		await api.close();
+		let clock = new Date('2026-11-17T00:00:00Z');
+		api = createShareApi({
+			databasePath: join(directory, 'shares.sqlite'), mediaDirectory: join(directory, 'media'),
+			adminToken: 'local-test-token', now: () => new Date(clock),
+			mediaProcessor: async (source, output) => {
+				await copyFile(source, output);
+				return { mimeType: 'audio/mpeg', durationMs: 180_000 };
+			}
+		});
+		const headers = { authorization: 'Bearer local-test-token', 'content-type': 'application/json' };
+		const lookup = (snapshot: unknown = metadata) => api.fetch(new Request('http://share.test/api/shares/reuse', {
+			method: 'POST', headers, body: JSON.stringify(snapshot)
+		}));
+		const create = async (key: string) => (await api.fetch(new Request('http://share.test/api/shares', {
+			method: 'POST', headers: { ...headers, 'idempotency-key': key }, body: JSON.stringify(metadata)
+		}))).json();
+		const publish = async (id: string) => {
+			await api.fetch(new Request(`http://share.test/api/shares/${id}/audio`, {
+				method: 'PUT', headers: { ...headers, 'content-type': 'audio/mpeg' }, body: new Uint8Array([1, 2, 3])
+			}));
+			await expect.poll(async () => (await lookup()).status).toBe(200);
+		};
+		const first = await create('reuse-lifecycle-1');
+		expect((await lookup()).status).toBe(204);
+		await publish(first.id);
+		for (const change of [
+			{ quality: 'lossless' }, { trackId: 'another' }, { accountId: 'another' },
+			{ playbackId: 'another' }, { template: 'minimal' }, { cardSquare: true },
+			{ coverHash: 'a'.repeat(64) }, { sourceId: 'another' },
+			{ lyrics: [{ text: 'Changed lyrics', atMs: 1000, endMs: 2000 }], selectedLineIndexes: [0] },
+			{ mode: 'clip', clipStartMs: 0, clipEndMs: 3000,
+				lyrics: [{ text: 'Clip', atMs: 1000, endMs: 2000 }], selectedLineIndexes: [0] }
+		]) {
+			expect((await lookup({ ...metadata, ...change })).status, JSON.stringify(change)).toBe(204);
+		}
+		await api.fetch(new Request(`http://share.test/api/shares/${first.id}`, { method: 'DELETE', headers }));
+		expect((await lookup()).status).toBe(204);
+		const second = await create('reuse-lifecycle-2');
+		await publish(second.id);
+		clock = new Date('2026-11-18T00:00:00Z');
+		expect((await lookup()).status).toBe(204);
+		expect((await api.fetch(new Request('http://share.test/api/shares/reuse', {
+			method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(metadata)
+		}))).status).toBe(401);
+		expect((await lookup({ title: 'invalid' })).status).toBe(400);
+	});
+
 	it('keeps original word timing in published lyrics for the web stage', async () => {
 		await api.close();
 		api = createShareApi({

@@ -134,6 +134,12 @@ export function createShareApi(options: ShareApiOptions) {
 	}
 
 	const findById = db.prepare<{ id: string }>('SELECT * FROM shares WHERE id = @id');
+	db.exec('CREATE INDEX IF NOT EXISTS shares_reuse ON shares(request_hash, status, expires_at)');
+	const findReusableShare = db.prepare<[string, string]>(`
+		SELECT * FROM shares
+		WHERE request_hash = ? AND status = 'ready' AND expires_at > ?
+		ORDER BY expires_at DESC, id DESC LIMIT 1
+	`);
 	const findByPublicToken = db.prepare<{ token: string }>(
 		'SELECT * FROM shares WHERE public_token = @token'
 	);
@@ -254,6 +260,7 @@ export function createShareApi(options: ShareApiOptions) {
 			}
 			if (parts[0] === 'api' && parts[1] === 'shares') {
 				if (!authorized(request, options.adminToken)) return json({ error: 'unauthorized' }, 401);
+				if (parts.length === 3 && parts[2] === 'reuse' && request.method === 'POST') return reuseShare(request);
 				if (parts.length === 2 && request.method === 'POST') return createShare(request);
 				if (parts.length === 2 && request.method === 'GET') return getShares(url);
 				if (parts.length === 3 && request.method === 'GET') return getShare(parts[2]);
@@ -315,6 +322,24 @@ export function createShareApi(options: ShareApiOptions) {
 			return cleanupTerminalMedia();
 		}
 	};
+
+	async function reuseShare(request: Request): Promise<Response> {
+		let raw: unknown;
+		try {
+			raw = await readJson(request);
+		} catch (error) {
+			return json(
+				{ error: error instanceof RangeError ? 'metadata_too_large' : 'invalid_json' },
+				error instanceof RangeError ? 413 : 400
+			);
+		}
+		const parsed = parseMetadata(raw);
+		if (!parsed.ok) return json({ error: 'invalid_metadata', field: parsed.field }, 400);
+		const hash = createHash('sha256').update(JSON.stringify(parsed.value)).digest('hex');
+		// 复用只查询完整快照，不算一次听歌访问，也不延长原分享有效期。
+		const row = findReusableShare.get(hash, now().toISOString()) as ShareRow | undefined;
+		return row ? json(shareDetails(row, publicOrigin), 200) : new Response(null, { status: 204 });
+	}
 
 	async function createShare(request: Request): Promise<Response> {
 			const idempotencyKey = request.headers.get('idempotency-key')?.trim() ?? '';
