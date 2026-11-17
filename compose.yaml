@@ -1,0 +1,46 @@
+services:
+  share:
+    build:
+      context: .
+    image: oh-mygo-share:local
+    restart: unless-stopped
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      ORIGIN: "${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN in .env}"
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN in .env}"
+      SHARE_ADMIN_TOKEN: "${SHARE_ADMIN_TOKEN:?Set SHARE_ADMIN_TOKEN in .env}"
+      SHARE_DATA_DIRECTORY: /app/data
+      SHARE_DATABASE_PATH: /app/data/shares.sqlite
+      SHARE_MEDIA_DIRECTORY: /app/data/media
+      SHARE_MAX_UPLOAD_BYTES: "${SHARE_MAX_UPLOAD_BYTES:-536870912}"
+      SHARE_MAX_STORAGE_BYTES: "${SHARE_MAX_STORAGE_BYTES:-10737418240}"
+      SHARE_MAX_CONCURRENT_JOBS: "${SHARE_MAX_CONCURRENT_JOBS:-2}"
+      SHARE_MAX_DURATION_MS: "${SHARE_MAX_DURATION_MS:-86400000}"
+      BODY_SIZE_LIMIT: "Infinity"
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      FFPROBE_PATH: /usr/bin/ffprobe
+    volumes:
+      - "${SHARE_DATA_DIRECTORY:-./data}:/app/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
