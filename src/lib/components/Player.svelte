@@ -1,6 +1,12 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import Lyrics from './Lyrics.svelte';
+	import Stage from './Stage.svelte';
+	import { createAudioSpectrum } from '../stage-audio';
+	import {
+		stageIntensities, stageLanguages, stagePreferences, stageStyles,
+		type StageIntensity, type StageLanguage, type StageStyle
+	} from '../stage';
 	import type { Session, ShareMetadata } from '../types';
 
 	type Props = {
@@ -18,10 +24,30 @@
 	let volume = $state(0.85);
 	let busy = $state(false);
 	let errorMessage = $state('');
+	let displayMode = $state<'lyrics' | 'stage'>('lyrics');
+	let stageStyle = $state<StageStyle>('flow');
+	let stageIntensity = $state<StageIntensity>('standard');
+	let stageLanguage = $state<StageLanguage>('bilingual');
+	let stageSparks = $state(false);
+	let stageHotComments = $state(true);
+	let preferencesLoaded = $state(false);
+	let spectrum: ReturnType<typeof createAudioSpectrum> | undefined;
+	const getLevels = () => spectrum?.levels() ?? null;
 	let activityInterval: ReturnType<typeof setInterval> | undefined;
 
 	onMount(() => {
 		durationMs = share.durationMs;
+		try {
+			const saved = stagePreferences(JSON.parse(localStorage.getItem('oh-mygo-share:stage:v1') ?? '{}'));
+			stageStyle = saved.style;
+			stageIntensity = saved.intensity;
+			stageLanguage = saved.language;
+			stageSparks = saved.sparks;
+			stageHotComments = saved.hotComments;
+		} catch {
+			// 禁用存储或旧数据损坏时仍可正常收听，只是不记住显示偏好。
+		}
+		preferencesLoaded = true;
 		void fetch(`/api/public/${token}/open`, { method: 'POST' })
 			.then((response) => {
 				if (!response.ok) errorMessage = response.status === 410 ? '分享已过期或被撤销。' : '未能更新有效期，播放时将重新检查。';
@@ -30,7 +56,13 @@
 		return () => closeSession();
 	});
 
-	onDestroy(() => closeSession());
+	onDestroy(() => { closeSession(); spectrum?.destroy(); });
+
+	$effect(() => {
+		if (!preferencesLoaded) return;
+		const saved = { style: stageStyle, intensity: stageIntensity, language: stageLanguage, sparks: stageSparks, hotComments: stageHotComments };
+		try { localStorage.setItem('oh-mygo-share:stage:v1', JSON.stringify(saved)); } catch {}
+	});
 
 	async function ensureSession(): Promise<boolean> {
 		if (sessionId && audioUrl) return true;
@@ -58,10 +90,13 @@
 			audio.pause();
 			return;
 		}
+		spectrum ??= createAudioSpectrum(audio);
+		const preparingSpectrum = spectrum.prepare();
 		if (!(await ensureSession())) return;
 		// 恢复前由服务端核验，不能依靠浏览器已缓冲的音频绕过暂停到期。
 		if (!(await sendActivity(true))) return;
 		try {
+			await preparingSpectrum;
 			await audio.play();
 		} catch {
 			errorMessage = '播放被阻塞，请点击播放重试。';
@@ -163,362 +198,568 @@
 	}
 </script>
 
-<div
-	class="player-shell"
-	data-theme={share.template}
->
+<div class="player-shell" class:stage-mode={displayMode === 'stage'} data-theme={share.template}>
 	<div
 		class="ambient"
 		style:background-image={share.coverUrl ? `url("${share.coverUrl}")` : undefined}
 	></div>
-	<main class="stage">
-		<section class="identity">
-			<div class="cover-frame" class:playing={playing}>
-				{#if share.coverUrl}
-					<img src={share.coverUrl} alt={`${share.title} cover`} />
-				{:else}
-					<div class="cover-placeholder" aria-hidden="true"></div>
+
+	<header class="stage-toolbar">
+		<nav class="display-tabs" aria-label="播放视图">
+			<button type="button" aria-pressed={displayMode === 'lyrics'} onclick={() => (displayMode = 'lyrics')}>歌词</button>
+			<button type="button" aria-pressed={displayMode === 'stage'} onclick={() => (displayMode = 'stage')}>律动</button>
+		</nav>
+		{#if displayMode === 'stage'}
+			<div class="stage-settings" aria-label="律动设置">
+				<select aria-label="律动效果" bind:value={stageStyle}>
+					{#each stageStyles as option}<option value={option.value}>{option.label}</option>{/each}
+				</select>
+				<select aria-label="动效强度" bind:value={stageIntensity}>
+					{#each stageIntensities as option}<option value={option.value}>{option.label}</option>{/each}
+				</select>
+				<select aria-label="律动语言" bind:value={stageLanguage}>
+					{#each stageLanguages as option}<option value={option.value}>{option.label}</option>{/each}
+				</select>
+				<button type="button" class="setting-toggle" aria-label="火花" aria-pressed={stageSparks} onclick={() => (stageSparks = !stageSparks)}>火花</button>
+				{#if share.hotComments?.length}
+					<button type="button" class="setting-toggle" aria-label="间奏热评" aria-pressed={stageHotComments} onclick={() => (stageHotComments = !stageHotComments)}>热评</button>
 				{/if}
 			</div>
+			<div class="stage-source">
+				<span>{share.mode === 'clip' ? '歌词片段' : '整首分享'}</span>
+				{#if share.sourceUrl}<a href={share.sourceUrl} target="_blank" rel="noreferrer">原曲</a>{/if}
+			</div>
+		{/if}
+	</header>
+
+	<main class="stage">
+		<section class="identity" aria-label="正在播放">
+			<div class="cover-frame">
+				{#if share.coverUrl}
+					<img src={share.coverUrl} alt={`${share.title}的封面`} />
+				{:else}
+					<div class="cover-placeholder" aria-label="暂无封面">
+						<svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+							<ellipse cx="7" cy="17" rx="3" ry="2.5" />
+							<ellipse cx="18" cy="15" rx="3" ry="2.5" />
+							<path d="M10 17V5l11-2v12M10 8l11-2" stroke-linejoin="round" />
+						</svg>
+					</div>
+				{/if}
+			</div>
+
 			<div class="song-info">
-				<p class="mode">{share.mode === 'clip' ? '歌词片段' : '整首分享'}</p>
-				<h1>{share.title}</h1>
-				<p class="artists">{share.artists}</p>
-				{#if share.sourceUrl}
-					<a href={share.sourceUrl} target="_blank" rel="noreferrer">查看歌曲原页 ↗</a>
+				<h1 title={share.title}>{share.title}</h1>
+				<p class="artists" title={share.artists}>{share.artists}</p>
+				<div class="share-info">
+					<span>{share.mode === 'clip' ? '歌词片段' : '整首分享'}</span>
+					{#if share.sourceUrl}
+						<a href={share.sourceUrl} target="_blank" rel="noreferrer">查看歌曲原页</a>
+					{/if}
+				</div>
+			</div>
+
+			<div class="controls">
+				<div class="timeline">
+					<input
+						aria-label="播放进度"
+						type="range"
+						min="0"
+						max={durationMs}
+						step="10"
+						value={currentTimeMs}
+						style:--fill={`${durationMs > 0 ? Math.min(100, currentTimeMs / durationMs * 100) : 0}%`}
+						oninput={seek}
+					/>
+					<div class="time-row">
+						<span>{formatTime(currentTimeMs)}</span>
+						<span>-{formatTime(durationMs - currentTimeMs)}</span>
+					</div>
+				</div>
+
+				<div class="transport">
+					<button
+						class="play-button"
+						type="button"
+						onclick={togglePlayback}
+						aria-label={playing ? '暂停' : '播放'}
+						aria-busy={busy}
+						disabled={busy}
+					>
+						{#if playing}
+							<svg viewBox="0 0 24 24" width="35" height="35" fill="currentColor" aria-hidden="true">
+								<rect x="5" y="3" width="5" height="18" rx="1.5" />
+								<rect x="14" y="3" width="5" height="18" rx="1.5" />
+							</svg>
+						{:else}
+							<svg viewBox="0 0 24 24" width="35" height="35" fill="currentColor" aria-hidden="true">
+								<path d="M6.5 3.8c0-.8.9-1.3 1.6-.9l13 8.2a1 1 0 0 1 0 1.8l-13 8.2c-.7.4-1.6-.1-1.6-.9V3.8Z" />
+							</svg>
+						{/if}
+						<span class="sr-only">{busy ? '准备中' : playing ? '暂停' : '播放'}</span>
+					</button>
+				</div>
+
+				<label class="volume-control">
+					<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+						<path d="M11 5 6 9H3v6h3l5 4V5Z" stroke-linejoin="round" />
+						<path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14" stroke-linecap="round" />
+					</svg>
+					<span class="sr-only">音量</span>
+					<input
+						aria-label="音量"
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={volume}
+						style:--fill={`${volume * 100}%`}
+						oninput={setVolume}
+					/>
+				</label>
+				{#if errorMessage}
+					<p class="error" role="alert">{errorMessage}</p>
 				{/if}
 			</div>
 		</section>
 
-		<section class="lyrics-stage" aria-label="Shared lyrics">
-			<Lyrics lyrics={share.lyrics} {currentTimeMs} />
-		</section>
+		{#if displayMode === 'stage'}
+			<section class="rhythm-stage" aria-label="律动">
+				<Stage lyrics={share.lyrics} {currentTimeMs} {durationMs} {playing} {audio}
+					coverUrl={share.coverUrl} title={share.title} style={stageStyle} intensity={stageIntensity}
+					sparks={stageSparks} language={stageLanguage} hotComments={share.hotComments}
+					showHotComments={stageHotComments} {getLevels} />
+			</section>
+		{:else}
+			<section class="lyrics-stage" aria-label="分享歌词">
+				<Lyrics lyrics={share.lyrics} {currentTimeMs} />
+			</section>
+		{/if}
 	</main>
 
-	<footer class="controls">
-		<audio
-			bind:this={audio}
-			bind:volume
-			onplay={onPlay}
-			onpause={onPause}
-			onended={onEnded}
-			ontimeupdate={updateTime}
-			onloadedmetadata={updateDuration}
-			onerror={() => (errorMessage = '音频加载失败。')}
-		></audio>
-		<div class="control-row">
-			<button
-				class="play-button"
-				class:loading={busy}
-				type="button"
-				onclick={togglePlayback}
-				aria-label={playing ? '暂停' : '播放'}
-				disabled={busy}
-			>
-				{#if playing}
-					<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
-				{:else}
-					<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-				{/if}
-				<span class="sr-only">{busy ? '准备中' : playing ? '暂停' : '播放'}</span>
-			</button>
-			<div class="timeline">
-				<div class="time-row">
-					<span>{formatTime(currentTimeMs)}</span>
-					<span>{formatTime(durationMs)}</span>
-				</div>
-				<input
-					aria-label="播放进度"
-					type="range"
-					min="0"
-					max={durationMs}
-					step="10"
-					value={currentTimeMs}
-					oninput={seek}
-				/>
-			</div>
-			<label class="volume-control">
-				<span class="sr-only">音量</span>
-				<input
-					aria-label="音量"
-					type="range"
-					min="0"
-					max="1"
-					step="0.01"
-					bind:value={volume}
-					oninput={setVolume}
-				/>
-			</label>
-		</div>
-		{#if errorMessage}
-			<p class="error" role="alert">{errorMessage}</p>
-		{/if}
-	</footer>
+	<audio
+		bind:this={audio}
+		bind:volume
+		preload="none"
+		onplay={onPlay}
+		onpause={onPause}
+		onended={onEnded}
+		ontimeupdate={updateTime}
+		onloadedmetadata={updateDuration}
+		onerror={() => (errorMessage = '音频加载失败。')}
+	></audio>
 </div>
 
 <style>
-.player-shell {
-    position: relative;
-    isolation: isolate;
-    min-height: 100svh;
-    overflow: hidden;
-    display: block;
-    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
-    line-height: 1.5;
-    background: #101116;
-    color: var(--ink);
-    --ink: #f4f1ee;
-    --muted: #b7b4bd;
-    --accent: #eabf9a;
-}
+	.player-shell {
+		--ink: #fff;
+		--muted: rgb(255 255 255 / 60%);
+		--accent: #fff;
+		--cover-size: clamp(180px, calc(100svh - 492px), 440px);
+		position: relative;
+		isolation: isolate;
+		display: grid;
+		grid-template-rows: auto minmax(0, 1fr);
+		height: 100svh;
+		width: 100%;
+		overflow: hidden;
+		box-sizing: border-box;
+		background: #0b0b0d;
+		color: var(--ink);
+		font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
+		line-height: 1.5;
+	}
 
-.ambient {
-    position: absolute;
-    inset: -12%;
-    z-index: -1;
-    background-size: cover;
-    background-position: center;
-    filter: blur(80px) brightness(0.62) saturate(1.2);
-    opacity: 0.6;
-    pointer-events: none;
-}
+	.ambient {
+		position: absolute;
+		inset: -15%;
+		pointer-events: none;
+		background-size: cover;
+		background-position: center;
+		filter: blur(80px) brightness(0.55) saturate(1.35);
+		opacity: 0.65;
+		animation: drift 24s ease-in-out infinite alternate;
+	}
 
-.ambient::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(120deg,rgba(12,14,18,.3),rgba(12,14,18,.65));
-}
+	.ambient::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: linear-gradient(180deg, rgb(11 11 13 / 8%), rgb(11 11 13 / 50%));
+	}
 
-.stage {
-    position: relative;
-    width: min(1120px, 100%);
-    margin: auto;
-    height: calc(100svh - 130px);
-    min-height: 500px;
-    padding: 50px 52px 20px;
-    display: grid;
-    grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
-    gap: clamp(48px, 7vw, 110px);
-    align-items: center;
-    box-sizing: border-box;
-    z-index: 1;
-}
+	.stage-toolbar {
+		position: relative;
+		z-index: 1;
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 24px;
+		min-height: 56px;
+		padding: 0 max(72px, calc((100% - 1280px) / 2));
+		color: #fff;
+		box-sizing: border-box;
+	}
 
-.identity {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 24px;
-    min-width: 0;
-}
+	.display-tabs, .stage-settings, .stage-source {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
 
-.cover-frame {
-    position: relative;
-    box-sizing: border-box;
-    width: 100%;
-    max-width: 340px;
-    aspect-ratio: 1;
-    flex-shrink: 0;
-    border-radius: 18px;
-    overflow: hidden;
-    outline: 1px solid rgba(255,255,255,0.1);
-    box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-}
+	.display-tabs button, .setting-toggle, .stage-settings select {
+		min-height: 44px;
+		border: 0;
+		border-radius: 999px;
+		padding: 6px 14px;
+		background: transparent;
+		color: rgb(255 255 255 / 55%);
+		font: 600 13px 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
+		cursor: pointer;
+	}
 
-.cover-frame img {
-    display: block;
-    height: 100%;
-    object-fit: cover;
-    width: 100%;
-}
+	.display-tabs button[aria-pressed='true'], .setting-toggle[aria-pressed='true'] {
+		background: rgb(255 255 255 / 14%);
+		color: #fff;
+	}
 
-.song-info {
-    color: var(--ink);
-}
+	.stage-settings select { padding-inline: 10px; color-scheme: dark; }
+	.stage-settings option { background: #17151c; color: #fff; }
+	.stage-settings select:focus-visible { outline: 2px solid rgb(255 255 255 / 85%); }
+	.stage-settings { flex-wrap: wrap; gap: 0 4px; }
+	.stage-source { margin-left: auto; gap: 14px; color: rgb(255 255 255 / 45%); font-size: 11px; }
+	.stage-source a { display: inline-flex; align-items: center; min-height: 44px; color: inherit; text-underline-offset: 4px; }
 
-.mode { margin: 0 0 10px; color: var(--accent); font-size: 11px; letter-spacing: 0.12em; }
-.song-info a { display: inline-block; margin-top: 14px; color: var(--muted); font-size: 12px; text-underline-offset: 4px; }
-.cover-placeholder { width: 100%; height: 100%; background: repeating-radial-gradient(circle at 50% 50%, #252933 0 2px, #171a22 3px 5px); }
-button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+	.stage {
+		position: relative;
+		display: grid;
+		grid-template-columns: max(280px, var(--cover-size)) minmax(0, 1fr);
+		gap: 72px;
+		width: 100%;
+		max-width: 1424px;
+		height: 100%;
+		margin: 0 auto;
+		padding: 72px 72px 44px;
+		box-sizing: border-box;
+		align-items: center;
+	}
 
-.song-info h1 {
-    font-size: clamp(24px, 2.3vw, 34px);
-    line-height: 1.3;
-    margin: 0;
-    text-wrap: balance;
-    word-break: normal;
-    overflow-wrap: anywhere;
-}
+	.identity {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+	}
 
-.artists {
-    color: var(--muted);
-    font-size: 14px;
-    margin: 8px 0 0;
-}
+	.cover-frame {
+		width: var(--cover-size);
+		max-width: 100%;
+		aspect-ratio: 1;
+		flex-shrink: 0;
+		border-radius: 16px;
+		overflow: hidden;
+		background: rgb(255 255 255 / 6%);
+		box-shadow: 0 14px 40px rgb(0 0 0 / 25%);
+	}
 
-.lyrics-stage {
-    height: min(62svh, 560px);
-    min-height: 0;
-    mask-image: linear-gradient(transparent, #000 12%, #000 88%, transparent);
-}
+	.cover-frame img {
+		display: block;
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
 
-.controls {
-    position: fixed;
-    bottom: 24px;
-    left: 50%;
-    transform: translateX(-50%);
-    width: min(980px, calc(100% - 48px));
-    box-sizing: border-box;
-    padding: 18px 24px;
-    border-radius: 20px;
-    backdrop-filter: blur(24px);
-    background: rgba(28, 27, 30, 0.78);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-    z-index: 2;
-}
+	.cover-placeholder {
+		display: grid;
+		place-items: center;
+		width: 100%;
+		height: 100%;
+		color: rgb(255 255 255 / 25%);
+	}
 
-.control-row {
-    display: flex;
-    align-items: center;
-    gap: 20px;
-}
+	.song-info {
+		margin-top: 36px;
+		min-width: 0;
+	}
 
-.play-button {
-    flex: 0 0 48px;
-    width: 48px;
-    height: 48px;
-    padding: 0;
-    cursor: pointer;
-    border-radius: 50%;
-    background: var(--accent);
-    border: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #000;
-    transition: transform 0.1s;
-}
-.play-button:hover { transform: translateY(-1px); }
-.play-button:active { transform: scale(0.96); }
-.play-button svg { flex-shrink: 0; }
-.sr-only { position: absolute; width: 1px; height: 1px; clip-path: inset(50%); overflow: hidden; white-space: nowrap; }
+	h1 {
+		margin: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 22px;
+		font-weight: 700;
+		line-height: 1.35;
+		letter-spacing: -0.3px;
+	}
 
-.timeline {
-    flex: 1;
-    min-width: 0;
-}
+	.artists {
+		margin: 4px 0 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 15px;
+		color: var(--muted);
+	}
 
-.time-row {
-    display: flex;
-    justify-content: space-between;
-    font-size: 12px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    margin-bottom: 9px;
-}
+	.share-info {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0 14px;
+		min-height: 32px;
+		color: rgb(255 255 255 / 45%);
+		font-size: 11px;
+	}
 
-.volume-control {
-    flex: 0 0 100px;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--muted);
-}
-.volume-control input { flex: 1; min-width: 0; }
-.error { margin: 12px 0 0; color: #efb3ab; font-size: 12px; }
+	.share-info a {
+		display: inline-flex;
+		align-items: center;
+		min-height: 44px;
+		color: inherit;
+		text-decoration-color: rgb(255 255 255 / 25%);
+		text-underline-offset: 4px;
+	}
 
-input[type=range] {
-    display: block;
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    margin: 0;
-    height: 4px;
-    appearance: none;
-    border: 0;
-    border-radius: 999px;
-    background: rgba(210, 208, 217, 0.28);
-    accent-color: var(--accent);
-    cursor: pointer;
-}
-input[type=range]::-webkit-slider-thumb {
-    appearance: none;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: var(--accent);
-    border: 0;
-    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
-}
-input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 50%; background: var(--accent); }
+	.share-info a:hover {
+		color: #fff;
+	}
 
-/* Themes */
-[data-theme='minimal'] { --ink: #f4f1ee; --muted: #b7b4bd; --accent: #eabf9a; background: #101116; }
-.player-shell[data-theme='minimal'] { background: #101116; }
-[data-theme='minimal'] .cover-frame { border-radius: 12px; }
+	.controls {
+		min-width: 0;
+	}
 
-[data-theme='cinema'] { --ink: #f4f1ee; --muted: #aaa8ad; --accent: #eabf9a; }
+	.time-row {
+		display: flex;
+		justify-content: space-between;
+		margin-top: -8px;
+		color: rgb(255 255 255 / 50%);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+	}
 
-[data-theme='vinyl'] .cover-frame { border-radius: 50%; }
+	.transport {
+		display: flex;
+		justify-content: center;
+		margin: 14px 0 10px;
+	}
 
-.player-shell[data-theme='polaroid'] { background: #efeeea; --ink: #25262a; --muted: #74767c; --accent: #956849; }
-[data-theme='polaroid'] .ambient { opacity: 0.13; }
-[data-theme='polaroid'] .cover-frame { border: 14px solid #fff; border-bottom-width: 42px; border-radius: 0; }
-[data-theme='polaroid'] .ambient::after { background: rgba(250,248,243,0.86); }
-[data-theme='polaroid'] .controls { background: rgba(250,248,243,0.86); border: 1px solid rgba(0,0,0,0.09); }
+	.play-button {
+		display: grid;
+		place-items: center;
+		width: 56px;
+		height: 56px;
+		border: 0;
+		border-radius: 12px;
+		padding: 0;
+		background: none;
+		color: #fff;
+		cursor: pointer;
+		transition: transform 120ms ease, opacity 120ms ease;
+	}
 
-[data-theme='vinyl'] .cover-frame { animation: spin 20s linear infinite; animation-play-state: paused; }
-[data-theme='vinyl'] .cover-frame.playing { animation-play-state: running; }
-@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-[data-theme=vinyl] .cover-frame { background: repeating-radial-gradient(circle,#151518 0px,#151518 2px,#232329 3px,#151518 4px); padding: 18%; box-sizing: border-box; }
-[data-theme=vinyl] .cover-frame img { border-radius: 50%; }
-[data-theme='vinyl'] .cover-frame::after { content: ''; position: absolute; width: 8px; height: 8px; border: 3px solid #17191d; border-radius: 50%; background: #d9d4cb; top: 50%; left: 50%; transform: translate(-50%, -50%); }
-[data-theme='cinema'] .cover-frame { border-radius: 8px; }
+	.play-button:hover {
+		opacity: 0.8;
+	}
 
-[data-theme='ticket'] .identity { border: 1px dashed rgba(255,255,255,0.3); padding: 24px; border-radius: 8px; }
+	.play-button:active {
+		transform: scale(0.94);
+	}
 
-/* Mobile */
-@media (max-width: 760px) {
-    .stage {
-        display: flex;
-        flex-direction: column;
-        padding: 28px 24px 120px;
-        height: 100svh;
-        min-height: 620px;
-        gap: 24px;
-    }
-    .identity { align-items: center; gap: 16px; text-align: center; }
-    .cover-frame { width: min(50vw, 200px); max-width: 200px; }
-    .song-info h1 { font-size: 22px; margin: 0; }
-    .lyrics-stage { width: 100%; flex: 1; min-height: 100px; }
-    .controls { bottom: 12px; padding: 14px 16px; width: calc(100% - 24px); }
-    .control-row { gap: 14px; }
-    .play-button { width: 44px; height: 44px; flex-basis: 44px; }
-    .volume-control { flex: 0 0 68px; }
-    .volume-control input { width: 48px; }
-.stage { padding: 28px 24px 120px; height: 100svh; min-height: 0; box-sizing: border-box; overflow: hidden; }
-    .identity { width: 100%; }
-    .song-info { width: 100%; max-width: 340px; }
-    .lyrics-stage { min-height: 80px; overflow: hidden; }
-}
+	.play-button:disabled {
+		cursor: wait;
+		opacity: 0.45;
+	}
 
-@media (max-height: 650px) {
-    .stage { padding-top: 20px; min-height: 0; gap: 18px; }
-    .identity { gap: 12px; }
-    .cover-frame { max-width: 200px; }
-    .song-info h1 { font-size: 20px; }
-    .lyrics-stage { height: 50svh; }
-}
-@media (max-width: 760px) and (max-height: 650px) {
-    .cover-frame { width: 120px; }
-    .song-info h1 { font-size: 18px; }
-    .mode { margin-bottom: 5px; }
-}
-@media (prefers-reduced-motion: reduce) {
-    [data-theme='vinyl'] .cover-frame { animation: none; }
-    .play-button { transition: none; }
-}
+	.volume-control {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		width: min(208px, 100%);
+		margin: 0 auto;
+		color: rgb(255 255 255 / 70%);
+	}
+
+	.volume-control svg {
+		flex-shrink: 0;
+	}
+
+	input[type='range'] {
+		--fill: 0%;
+		display: block;
+		appearance: none;
+		width: 100%;
+		min-width: 0;
+		height: 44px;
+		margin: 0;
+		padding: 0;
+		border: 0;
+		background: transparent;
+		cursor: pointer;
+	}
+
+	input[type='range']::-webkit-slider-runnable-track {
+		height: 4px;
+		border-radius: 999px;
+		background: linear-gradient(to right, rgb(255 255 255 / 90%) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+	}
+
+	input[type='range']::-moz-range-track {
+		height: 4px;
+		border-radius: 999px;
+		background: linear-gradient(to right, rgb(255 255 255 / 90%) var(--fill), rgb(255 255 255 / 18%) var(--fill));
+	}
+
+	input[type='range']::-webkit-slider-thumb {
+		appearance: none;
+		width: 10px;
+		height: 10px;
+		margin-top: -3px;
+		border: 0;
+		border-radius: 50%;
+		background: #fff;
+	}
+
+	input[type='range']::-moz-range-thumb {
+		width: 10px;
+		height: 10px;
+		border: 0;
+		border-radius: 50%;
+		background: #fff;
+	}
+
+	.lyrics-stage {
+		height: 100%;
+		min-width: 0;
+		min-height: 0;
+		overflow: hidden;
+		padding-top: 24px;
+		box-sizing: border-box;
+	}
+
+	.rhythm-stage { grid-row: 1; height: 100%; min-height: 0; min-width: 0; overflow: hidden; }
+	.stage-mode .stage {
+		grid-template-columns: minmax(0, 1fr);
+		grid-template-rows: minmax(0, 1fr) auto;
+		gap: 12px;
+		padding: 0 48px 24px;
+		max-width: none;
+	}
+	.stage-mode .identity {
+		display: grid;
+		grid-row: 2;
+		grid-template-columns: 44px minmax(0, 1fr) 56px minmax(120px, 208px);
+		align-items: center;
+		gap: 0 14px;
+	}
+	.stage-mode .controls { display: contents; }
+	.stage-mode .timeline { grid-row: 1; grid-column: 1 / -1; }
+	.stage-mode .time-row { margin-top: -10px; margin-bottom: 8px; }
+	.stage-mode .cover-frame { width: 44px; grid-row: 2; grid-column: 1; border-radius: 8px; }
+	.stage-mode .song-info { grid-row: 2; grid-column: 2; margin: 0; }
+	.stage-mode h1 { font-size: 14px; }
+	.stage-mode .artists { font-size: 12px; margin-top: 2px; }
+	.stage-mode .share-info { display: none; }
+	.stage-mode .transport { grid-row: 2; grid-column: 3; margin: 0; }
+	.stage-mode .volume-control { grid-row: 2; grid-column: 4; width: 100%; }
+	.stage-mode .error { grid-row: 3; grid-column: 1 / -1; }
+
+	.error {
+		margin: 8px 0 0;
+		color: #efb3ab;
+		font-size: 12px;
+		overflow-wrap: anywhere;
+	}
+
+	button:focus-visible,
+	a:focus-visible,
+	input:focus-visible {
+		outline: 2px solid rgb(255 255 255 / 85%);
+		outline-offset: 4px;
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		clip-path: inset(50%);
+		overflow: hidden;
+		white-space: nowrap;
+	}
+
+	@keyframes drift {
+		from { transform: translate(-2%, -1%) scale(1); }
+		to { transform: translate(3%, 2%) scale(1.08); }
+	}
+
+	@media (min-width: 761px) and (max-width: 1050px) {
+		.player-shell { --cover-size: clamp(180px, calc(100svh - 436px), 32vw); }
+		.stage { gap: 40px; padding-inline: 40px; }
+	}
+
+	@media (max-width: 760px) {
+		.stage-toolbar { padding: max(4px, env(safe-area-inset-top)) 20px 4px; gap: 0 8px; }
+		.stage-settings { order: 3; width: 100%; gap: 0 2px; }
+		.stage-settings select { padding-inline: 8px; }
+		.stage-settings .setting-toggle { padding-inline: 10px; }
+		.stage-source { font-size: 10px; }
+		.stage {
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-rows: max-content minmax(0, 1fr);
+			gap: 16px;
+			padding: max(20px, env(safe-area-inset-top)) 20px max(16px, env(safe-area-inset-bottom));
+		}
+
+		.identity {
+			display: grid;
+			grid-template-columns: clamp(112px, 30vw, 140px) minmax(0, 1fr);
+			align-items: center;
+			gap: 12px 16px;
+		}
+
+		.cover-frame {
+			width: 100%;
+			border-radius: 12px;
+		}
+
+		.song-info {
+			margin: 0;
+		}
+
+		h1 {
+			font-size: 20px;
+			white-space: normal;
+			overflow-wrap: anywhere;
+			display: -webkit-box;
+			-webkit-box-orient: vertical;
+			-webkit-line-clamp: 2;
+			line-clamp: 2;
+		}
+
+		.artists { font-size: 13px; }
+		.share-info { gap: 0 8px; font-size: 10px; }
+
+		.controls {
+			display: grid;
+			grid-column: 1 / -1;
+			grid-template-columns: 56px minmax(0, 1fr);
+			align-items: center;
+			gap: 4px 20px;
+		}
+
+		.timeline { grid-column: 1 / -1; }
+		.transport { margin: 0; }
+		.volume-control { justify-self: end; margin: 0; }
+		.error { grid-column: 1 / -1; margin: 4px 0; }
+		.lyrics-stage { padding-top: 0; }
+		.stage-mode .stage { padding: 0 20px max(16px, env(safe-area-inset-bottom)); gap: 6px; }
+		.stage-mode .identity { grid-template-columns: 44px minmax(0, 1fr) 56px; gap: 0 12px; }
+		.stage-mode .volume-control { grid-row: 3; grid-column: 2 / -1; width: min(208px, 100%); }
+		.stage-mode .error { grid-row: 4; }
+		.stage-mode h1 { display: block; white-space: nowrap; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.ambient { animation: none; }
+		.play-button { transition: none; }
+	}
 </style>

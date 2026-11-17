@@ -36,6 +36,39 @@ describe('share management HTTP API', () => {
 		await rm(directory, { recursive: true, force: true });
 	});
 
+	it('keeps original word timing in published lyrics for the web stage', async () => {
+		await api.close();
+		api = createShareApi({
+			databasePath: join(directory, 'shares.sqlite'), mediaDirectory: join(directory, 'media'),
+			adminToken: 'local-test-token',
+			mediaProcessor: async (source, output) => {
+				await copyFile(source, output);
+				return { mimeType: 'audio/mpeg', durationMs: 180_000 };
+			}
+		});
+		const words = [{ text: 'Blue ', startMs: 1100, endMs: 1800 }, { text: 'hour', startMs: 2400, endMs: 3800 }];
+		const hotComments = [{ text: 'Keep this moment', author: 'Listener', likes: 12 }];
+		const headers = { authorization: 'Bearer local-test-token', 'content-type': 'application/json' };
+		const created = await api.fetch(new Request('http://share.test/api/shares', {
+			method: 'POST', headers: { ...headers, 'idempotency-key': 'stage-timing' },
+			body: JSON.stringify({ ...metadata, hotComments, lyrics: [{ text: 'Blue hour', atMs: 1000, endMs: 4000, words }] })
+		}));
+		expect(created.status).toBe(201);
+		const share = await created.json();
+		await api.fetch(new Request(`http://share.test/api/shares/${share.id}/audio`, {
+			method: 'PUT', headers: { ...headers, 'content-type': 'audio/mpeg' }, body: new Uint8Array([1, 2, 3, 4])
+		}));
+		let detail: { url?: string; status?: string } = {};
+		await expect.poll(async () => {
+			detail = await (await api.fetch(new Request(`http://share.test/api/shares/${share.id}`, { headers }))).json();
+			return detail.status;
+		}).toBe('ready');
+		const token = new URL(detail.url!).pathname.split('/').at(-1);
+		const published = await (await api.fetch(new Request(`http://share.test/api/public/${token}`))).json();
+		expect(published.lyrics[0].words).toEqual(words);
+		expect(published.hotComments).toEqual(hotComments);
+	});
+
 	it('does not keep a paused session alive with repeated pause events or range reads', async () => {
 		await api.close();
 		let clock = new Date('2026-11-17T00:00:00Z');
@@ -74,6 +107,53 @@ describe('share management HTTP API', () => {
 		await ranged.arrayBuffer();
 		clock = new Date('2026-11-17T00:15:00Z');
 		expect((await pause()).status).toBe(410);
+	});
+
+	it('clips word timestamps to the published audio and rejects invalid word order', async () => {
+		const headers = { authorization: 'Bearer local-test-token', 'content-type': 'application/json' };
+		const create = (body: unknown, key: string) => api.fetch(new Request('http://share.test/api/shares', {
+			method: 'POST', headers: { ...headers, 'idempotency-key': key }, body: JSON.stringify(body)
+		}));
+		const invalid = await create({ ...metadata, lyrics: [{
+			text: 'Invalid', atMs: 1000, endMs: 4000,
+			words: [{ text: 'later', startMs: 2400, endMs: 3000 }, { text: 'earlier', startMs: 1200, endMs: 1800 }]
+		}] }, 'invalid-stage-order');
+		expect(invalid.status).toBe(400);
+		await api.close();
+		api = createShareApi({
+			databasePath: join(directory, 'shares.sqlite'), mediaDirectory: join(directory, 'media'),
+			adminToken: 'local-test-token',
+			mediaProcessor: async (source, output) => {
+				await copyFile(source, output);
+				return { mimeType: 'audio/mpeg', durationMs: 3000 };
+			}
+		});
+		const created = await create({
+			...metadata, mode: 'clip', clipStartMs: 2000, clipEndMs: 5000, selectedLineIndexes: [1],
+			lyrics: [
+				{ text: 'A crossing line', atMs: 1000, endMs: 3500, words: [
+					{ text: 'outside ', startMs: 1200, endMs: 1800 },
+					{ text: 'crossing ', startMs: 1900, endMs: 2300 },
+					{ text: 'inside', startMs: 3100, endMs: 3400 }
+				] },
+				{ text: 'Selected', atMs: 3000, endMs: 4000 }
+			]
+		}, 'clip-stage-timing');
+		expect(created.status).toBe(201);
+		const share = await created.json();
+		await api.fetch(new Request(`http://share.test/api/shares/${share.id}/audio`, {
+			method: 'PUT', headers: { ...headers, 'content-type': 'audio/mpeg' }, body: new Uint8Array([1, 2, 3, 4])
+		}));
+		let detail: { url?: string; status?: string } = {};
+		await expect.poll(async () => {
+			detail = await (await api.fetch(new Request(`http://share.test/api/shares/${share.id}`, { headers }))).json();
+			return detail.status;
+		}).toBe('ready');
+		const token = new URL(detail.url!).pathname.split('/').at(-1);
+		const published = await (await api.fetch(new Request(`http://share.test/api/public/${token}`))).json();
+		expect(published.lyrics[0].words).toEqual([
+			{ text: 'crossing ', startMs: 0, endMs: 300 }, { text: 'inside', startMs: 1100, endMs: 1400 }
+		]);
 	});
 
 	it('refuses share creation without the service management token', async () => {

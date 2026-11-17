@@ -8,38 +8,36 @@
 
 	let { lyrics, currentTimeMs }: Props = $props();
 
-	function active(line: ShareLyric): boolean {
-		return currentTimeMs >= line.atMs && currentTimeMs < line.endMs;
-	}
-
 	let container = $state<HTMLElement | null>(null);
 	let lineElements = $state<HTMLElement[]>([]);
+	const activeIndex = $derived(
+		lyrics.findIndex((line) => currentTimeMs >= line.atMs && currentTimeMs < line.endMs)
+	);
 	let lastActiveIndex = -1;
 
 	$effect(() => {
-		const activeIndex = lyrics.findIndex(
-			(line) => currentTimeMs >= line.atMs && currentTimeMs < line.endMs
-		);
 		if (activeIndex !== lastActiveIndex && activeIndex !== -1 && lineElements[activeIndex] && container) {
 			const line = lineElements[activeIndex];
+			// 只在换行时移动歌词容器，保留手动滚动，并与桌面版的三成定位一致。
 			container.scrollTo({
-				top: line.offsetTop - container.offsetTop - (container.clientHeight - line.clientHeight) / 2,
+				top: Math.max(0, line.offsetTop - container.clientHeight * 0.3),
 				behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
 			});
-			lastActiveIndex = activeIndex;
 		}
+		lastActiveIndex = activeIndex;
 	});
 </script>
 
-<section class="lyrics" aria-label="Lyrics" bind:this={container}>
+<section class="lyrics" aria-label="歌词" bind:this={container}>
 	{#if lyrics.length === 0}
 		<p class="empty">这次分享没有歌词，安心听歌吧。</p>
 	{:else}
 		{#each lyrics as line, i}
 			<article
 				class="line"
-				class:active={active(line)}
+				class:active={i === activeIndex}
 				class:selected={line.selected}
+				aria-current={i === activeIndex ? 'true' : undefined}
 				bind:this={lineElements[i]}
 			>
 				<p class="text">{line.text}</p>
@@ -52,37 +50,79 @@
 </section>
 
 <style>
-.lyrics {
-    position: relative;
-    box-sizing: border-box;
-    height: 100%;
-    overflow-y: auto;
-    scrollbar-width: none;
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 32px;
-    padding: 35% 8px;
-}
+	.lyrics {
+		position: relative;
+		box-sizing: border-box;
+		height: 100%;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		scrollbar-width: none;
+		padding: 0 8px 0 0;
+	}
 
-.line {
-    position: relative;
-    padding-left: 12px;
-    opacity: 0.65;
-    color: var(--muted, #b7b4bd);
-    flex-shrink: 0;
-}
-.line.active { opacity: 1; color: var(--ink); }
-.line.selected { opacity: 0.9; border-left: 2px solid var(--accent); }
-.line.active.selected { opacity: 1; }
-.text { font-size: 24px; font-weight: 600; line-height: 1.5; margin: 0; }
-.translation { font-size: 13px; line-height: 1.6; opacity: 0.7; margin-top: 6px; }
-.empty { color: var(--muted, #aaa8ad); margin: 0; }
+	.lyrics::after {
+		content: '';
+		display: block;
+		height: 70%;
+	}
 
-@media (max-width: 760px) {
-    .text { font-size: 19px; }
-}
-@media (prefers-reduced-motion: reduce) {
-    .line { transition: none; }
-}
+	.line {
+		position: relative;
+		padding: 10px 12px;
+		margin-bottom: 6px;
+		border-radius: 12px;
+		color: #fff;
+		opacity: 0.28;
+		transform: scale(0.94);
+		transform-origin: left center;
+		transition: opacity 380ms ease, transform 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+
+	.line:hover { opacity: 0.55; background: rgb(255 255 255 / 6%); }
+	.line.active { opacity: 1; transform: scale(1); }
+	.line.selected::before {
+		content: '';
+		position: absolute;
+		left: 1px;
+		top: 14px;
+		bottom: 14px;
+		width: 2px;
+		border-radius: 2px;
+		background: rgb(255 255 255 / 70%);
+	}
+
+	.text {
+		margin: 0;
+		font-size: 30px;
+		font-weight: 800;
+		line-height: 1.25;
+		letter-spacing: -0.4px;
+		overflow-wrap: anywhere;
+	}
+
+	.translation {
+		margin: 6px 0 0;
+		font-size: 17px;
+		font-weight: 600;
+		line-height: 1.5;
+		color: rgb(255 255 255 / 70%);
+		overflow-wrap: anywhere;
+	}
+
+	.empty {
+		margin: 16px 12px;
+		color: rgb(255 255 255 / 40%);
+		font-size: 24px;
+		font-weight: 700;
+	}
+
+	@media (max-width: 760px) {
+		.text { font-size: 24px; }
+		.translation { font-size: 14px; }
+		.empty { font-size: 20px; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.line { transition: none; }
+	}
 </style>

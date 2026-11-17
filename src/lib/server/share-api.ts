@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { processMediaFile } from './media-processor';
+import type { ShareHotComment, ShareLyricWord } from '../types';
 
 const templates = new Set(['minimal', 'cinema', 'vinyl', 'polaroid', 'ticket']);
 const maxMetadataBytes = 1024 * 1024;
@@ -41,8 +42,11 @@ export type ShareMetadata = {
 		translation?: string;
 		atMs: number;
 		endMs: number;
+		words?: ShareLyricWord[];
+		stageEndMs?: number;
 	}>;
 	selectedLineIndexes: number[];
+	hotComments?: ShareHotComment[];
 	clipStartMs?: number;
 	clipEndMs?: number;
 	sourceUrl?: string;
@@ -631,13 +635,23 @@ export function createShareApi(options: ShareApiOptions) {
 						.map((line, index) => ({ line, index }))
 						.filter(
 							({ line }) =>
-								line.endMs > (metadata.clipStartMs ?? 0) && line.atMs < (metadata.clipEndMs ?? 0)
+								(line.stageEndMs ?? line.endMs) > (metadata.clipStartMs ?? 0) && line.atMs < (metadata.clipEndMs ?? 0)
 						)
 						.map(({ line, index }) => ({
 							text: line.text,
 							...(line.translation ? { translation: line.translation } : {}),
 							atMs: Math.max(0, line.atMs - (metadata.clipStartMs ?? 0)),
 							endMs: Math.min(metadata.clipEndMs ?? line.endMs, line.endMs) - (metadata.clipStartMs ?? 0),
+							...(line.stageEndMs !== undefined ? { stageEndMs: Math.min(metadata.clipEndMs!, line.stageEndMs) - metadata.clipStartMs! } : {}),
+							...(line.words ? {
+								words: line.words
+									.filter((word) => word.endMs > metadata.clipStartMs! && word.startMs < metadata.clipEndMs!)
+									.map((word) => ({
+										text: word.text,
+										startMs: Math.max(word.startMs, metadata.clipStartMs!) - metadata.clipStartMs!,
+										endMs: Math.min(word.endMs, metadata.clipEndMs!) - metadata.clipStartMs!
+									}))
+							} : {}),
 							selected: selected.has(index)
 						}))
 				: metadata.lyrics.map((line, index) => ({
@@ -654,6 +668,7 @@ export function createShareApi(options: ShareApiOptions) {
 			mode: metadata.mode,
 			durationMs: row.duration_ms,
 			lyrics,
+			...(metadata.hotComments?.length ? { hotComments: metadata.hotComments } : {}),
 			...(row.cover_path ? { coverUrl: `/api/public/${token}/cover` } : {}),
 			...(metadata.sourceUrl ? { sourceUrl: metadata.sourceUrl } : {}),
 			audioUrl: `/api/public/${token}/audio`,
@@ -1151,11 +1166,29 @@ function parseMetadata(value: unknown): { ok: true; value: ShareMetadata } | { o
 		) {
 			return { ok: false, field: 'lyrics' };
 		}
+		const stageEndMs = line.stageEndMs;
+		if (stageEndMs !== undefined && !isIntegerInRange(stageEndMs, line.atMs + 1, line.endMs)) return { ok: false, field: 'stageEndMs' };
+		let words: ShareLyricWord[] | undefined;
+		if (line.words !== undefined) {
+			if (!Array.isArray(line.words) || line.words.length > 2000) return { ok: false, field: 'words' };
+			words = [];
+			for (const word of line.words) {
+				if (!isRecord(word) || typeof word.text !== 'string' || !word.text.trim() || word.text.length > 4000 ||
+					!isIntegerInRange(word.startMs, line.atMs, line.endMs - 1) ||
+					!isIntegerInRange(word.endMs, word.startMs + 1, line.endMs) ||
+					(words.length > 0 && word.startMs < words[words.length - 1].startMs)) {
+					return { ok: false, field: 'words' };
+				}
+				words.push({ text: word.text, startMs: word.startMs, endMs: word.endMs });
+			}
+		}
 		lyrics.push({
 			text,
 			...(translation ? { translation } : {}),
 			atMs: line.atMs,
-			endMs: line.endMs
+			endMs: line.endMs,
+			...(stageEndMs !== undefined ? { stageEndMs } : {}),
+			...(words ? { words } : {})
 		});
 	}
 
@@ -1168,6 +1201,18 @@ function parseMetadata(value: unknown): { ok: true; value: ShareMetadata } | { o
 		}
 		seen.add(index);
 		selectedLineIndexes.push(index);
+	}
+
+	let hotComments: ShareHotComment[] | undefined;
+	if (value.hotComments !== undefined) {
+		if (!Array.isArray(value.hotComments) || value.hotComments.length > 10) return { ok: false, field: 'hotComments' };
+		hotComments = [];
+		for (const comment of value.hotComments) {
+			if (!isRecord(comment) || typeof comment.text !== 'string' || !comment.text.trim() ||
+				[...comment.text].length > 140 || typeof comment.author !== 'string' || comment.author.length > 128 ||
+				!isIntegerInRange(comment.likes, 0, Number.MAX_SAFE_INTEGER)) return { ok: false, field: 'hotComments' };
+			hotComments.push({ text: comment.text.trim(), author: comment.author, likes: comment.likes });
+		}
 	}
 
 	let clipStartMs: number | undefined;
@@ -1235,6 +1280,7 @@ function parseMetadata(value: unknown): { ok: true; value: ShareMetadata } | { o
 			durationMs,
 			lyrics,
 			selectedLineIndexes,
+			...(hotComments?.length ? { hotComments } : {}),
 			...(clipStartMs === undefined ? {} : { clipStartMs, clipEndMs }),
 			...(sourceUrl ? { sourceUrl } : {}),
 			...(coverHash ? { coverHash } : {})

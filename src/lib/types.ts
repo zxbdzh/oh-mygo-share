@@ -1,11 +1,25 @@
 export type ShareTemplate = 'minimal' | 'cinema' | 'vinyl' | 'polaroid' | 'ticket';
 
+export type ShareLyricWord = {
+	text: string;
+	startMs: number;
+	endMs: number;
+};
+
+export type ShareHotComment = {
+	text: string;
+	author: string;
+	likes: number;
+};
+
 export type ShareLyric = {
 	text: string;
 	translation?: string;
 	atMs: number;
 	endMs: number;
 	selected?: boolean;
+	words?: ShareLyricWord[];
+	stageEndMs?: number;
 };
 
 export type ShareMetadata = {
@@ -17,6 +31,7 @@ export type ShareMetadata = {
 	mode: 'full' | 'clip';
 	durationMs: number;
 	lyrics: ShareLyric[];
+	hotComments?: ShareHotComment[];
 	coverUrl?: string;
 	sourceUrl?: string;
 	audioUrl?: string;
