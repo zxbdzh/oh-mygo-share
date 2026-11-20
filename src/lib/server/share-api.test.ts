@@ -218,8 +218,8 @@ describe('share management HTTP API', () => {
 				return { mimeType: 'audio/mpeg', durationMs: 3000 };
 			}
 		});
-		const created = await create({
-			...metadata, mode: 'clip', clipStartMs: 2000, clipEndMs: 5000, selectedLineIndexes: [1],
+		const clip = {
+			...metadata, mode: 'clip', clipStartMs: 2100, clipEndMs: 5100, selectedLineIndexes: [1],
 			lyrics: [
 				{ text: 'A crossing line', atMs: 1000, endMs: 3500, words: [
 					{ text: 'outside ', startMs: 1200, endMs: 1800 },
@@ -228,7 +228,8 @@ describe('share management HTTP API', () => {
 				] },
 				{ text: 'Selected', atMs: 3000, endMs: 4000 }
 			]
-		}, 'clip-stage-timing');
+		};
+		const created = await create(clip, 'clip-stage-timing');
 		expect(created.status).toBe(201);
 		const share = await created.json();
 		await api.fetch(new Request(`http://share.test/api/shares/${share.id}/audio`, {
@@ -242,8 +243,13 @@ describe('share management HTTP API', () => {
 		const token = new URL(detail.url!).pathname.split('/').at(-1);
 		const published = await (await api.fetch(new Request(`http://share.test/api/public/${token}`))).json();
 		expect(published.lyrics[0].words).toEqual([
-			{ text: 'crossing ', startMs: 0, endMs: 300 }, { text: 'inside', startMs: 1100, endMs: 1400 }
+			{ text: 'crossing ', startMs: 0, endMs: 200 }, { text: 'inside', startMs: 1000, endMs: 1300 }
 		]);
+		const lookup = (snapshot: unknown) => api.fetch(new Request('http://share.test/api/shares/reuse', {
+			method: 'POST', headers, body: JSON.stringify(snapshot)
+		}));
+		expect((await lookup(clip)).status).toBe(200);
+		expect((await lookup({ ...clip, clipEndMs: 5101 })).status).toBe(204);
 	});
 
 	it('refuses share creation without the service management token', async () => {
@@ -299,7 +305,7 @@ describe('share management HTTP API', () => {
 		} finally { finish(); }
 	});
 
-	it('rejects an audio clip range that does not include selected lyrics and padding', async () => {
+	it('rejects invalid clip bounds regardless of selected lyrics', async () => {
 		const clip = {
 			...metadata,
 			mode: 'clip',
@@ -313,20 +319,25 @@ describe('share management HTTP API', () => {
 			clipStartMs: 1_001,
 			clipEndMs: 10_000
 		};
-		const response = await api.fetch(
-			new Request('http://share.test/api/shares', {
+		for (const [start, end, field] of [
+			[-1, 10000, 'clipStartMs'],
+			[1000.5, 10000, 'clipStartMs'],
+			[2000, 1000, 'clipEndMs'],
+			[1000, 1000, 'clipEndMs'],
+			[1000, 30001, 'clipEndMs']
+		] as const) {
+			const response = await api.fetch(new Request('http://share.test/api/shares', {
 				method: 'POST',
 				headers: {
 					authorization: 'Bearer local-test-token',
 					'content-type': 'application/json',
 					'idempotency-key': 'invalid-clip-1'
 				},
-				body: JSON.stringify(clip)
-			})
-		);
-
-		expect(response.status).toBe(400);
-		expect(await response.json()).toEqual({ error: 'invalid_metadata', field: 'clipRange' });
+				body: JSON.stringify({ ...clip, clipStartMs: start, clipEndMs: end })
+			}));
+			expect(response.status).toBe(400);
+			expect(await response.json()).toEqual({ error: 'invalid_metadata', field });
+		}
 	});
 
 	it('accepts a continuous clip that spans unselected lines with one second padding', async () => {

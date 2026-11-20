@@ -1248,14 +1248,7 @@ function parseMetadata(value: unknown): { ok: true; value: ShareMetadata } | { o
 		if (!isIntegerInRange(value.clipEndMs, value.clipStartMs + 1, durationMs)) {
 			return { ok: false, field: 'clipEndMs' };
 		}
-		const selectedLines = selectedLineIndexes.map((index) => lyrics[index]);
-		const firstSelectedAt = Math.min(...selectedLines.map((line) => line.atMs));
-		const lastSelectedEnd = Math.max(...selectedLines.map((line) => line.endMs));
-		const expectedStart = Math.max(0, firstSelectedAt - 1000);
-		const expectedEnd = Math.min(durationMs, lastSelectedEnd + 1000);
-		if (value.clipStartMs !== expectedStart || value.clipEndMs !== expectedEnd) {
-			return { ok: false, field: 'clipRange' };
-		}
+		// 选句用于歌词展示，音频按分享者确认的起止点裁切。
 		clipStartMs = value.clipStartMs;
 		clipEndMs = value.clipEndMs;
 	} else if (value.clipStartMs !== undefined || value.clipEndMs !== undefined) {

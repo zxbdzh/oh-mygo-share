@@ -57,6 +57,13 @@ describe('media processing', () => {
 			expect(result.mimeType).toBe('audio/wav');
 			expect(result.durationMs).toBeGreaterThanOrEqual(109);
 			expect(result.durationMs).toBeLessThanOrEqual(111);
+			const pcm = (path: string) => execute(ffmpeg, [
+				'-v', 'error', '-i', path, '-f', 's16le', 'pipe:1'
+			], { encoding: 'buffer' });
+			const [original, cropped] = await Promise.all([pcm(source), pcm(output)]);
+			const firstByte = Math.round(metadata.clipStartMs! * 44.1) * 2;
+			const lastByte = Math.round(metadata.clipEndMs! * 44.1) * 2;
+			expect(cropped.stdout).toEqual(original.stdout.subarray(firstByte, lastByte));
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
